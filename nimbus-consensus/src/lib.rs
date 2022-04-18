@@ -29,14 +29,12 @@ use cumulus_primitives_core::{
 };
 pub use import_queue::import_queue;
 use log::{debug, info, warn};
-use nimbus_primitives::{
-	AuthorFilterAPI, CompatibleDigestItem, NimbusApi, NimbusId, NIMBUS_KEY_ID,
-};
+use nimbus_primitives::{CompatibleDigestItem, NimbusApi, NimbusId, NIMBUS_KEY_ID};
 use parking_lot::Mutex;
 use polkadot_client::ClientHandle;
 use sc_client_api::Backend;
 use sc_consensus::{BlockImport, BlockImportParams};
-use sp_api::{ApiExt, BlockId, ProvideRuntimeApi};
+use sp_api::{BlockId, ProvideRuntimeApi};
 use sp_application_crypto::CryptoTypePublicPair;
 use sp_consensus::{
 	BlockOrigin, EnableProofRecording, Environment, ProofRecording, Proposal, Proposer,
@@ -195,7 +193,6 @@ pub(crate) fn first_eligible_key<B: BlockT, C>(
 where
 	C: ProvideRuntimeApi<B>,
 	C::Api: NimbusApi<B>,
-	C::Api: AuthorFilterAPI<B, NimbusId>,
 {
 	// Get all the available keys
 	let available_keys = SyncCryptoStore::keys(keystore, NIMBUS_KEY_ID)
@@ -209,38 +206,8 @@ where
 		);
 		return None;
 	}
+
 	let at = BlockId::Hash(parent.hash());
-
-	// helper function for calling the various runtime apis and versions
-	let prediction_helper = |at, nimbus_id: NimbusId, slot: u32, parent| -> bool {
-		let has_nimbus_api = client
-			.runtime_api()
-			.has_api::<dyn NimbusApi<B>>(at)
-			.expect("should be able to dynamically detect the api");
-
-		if has_nimbus_api {
-			NimbusApi::can_author(&*client.runtime_api(), at, nimbus_id, slot, parent)
-				.expect("NimbusAPI should not return error")
-		} else {
-			// There are two versions of the author filter, so we do that dynamically also.
-			let api_version = client
-				.runtime_api()
-				.api_version::<dyn AuthorFilterAPI<B, NimbusId>>(&at)
-				.expect("Runtime api access to not error.")
-				.expect("Should be able to detect author filter version");
-
-			if api_version >= 2 {
-				AuthorFilterAPI::can_author(&*client.runtime_api(), at, nimbus_id, slot, parent)
-					.expect("Author API should not return error")
-			} else {
-				#[allow(deprecated)]
-				client
-					.runtime_api()
-					.can_author_before_version_2(&at, nimbus_id, slot_number)
-					.expect("Author API version 2 should not return error")
-			}
-		}
-	};
 
 	// Iterate keys until we find an eligible one, or run out of candidates.
 	// If we are skipping prediction, then we author with the first key we find.
@@ -248,12 +215,14 @@ where
 	let maybe_key = available_keys.into_iter().find(|type_public_pair| {
 		// Have to convert to a typed NimbusId to pass to the runtime API. Maybe this is a clue
 		// That I should be passing Vec<u8> across the wasm boundary?
-		prediction_helper(
+		NimbusApi::can_author(
+			&*client.runtime_api(),
 			&at,
 			NimbusId::from_slice(&type_public_pair.1),
 			slot_number,
 			parent,
 		)
+		.expect("NimbusAPI should not return error")
 	});
 
 	// If there are no eligible keys, print the log, and exit early.
@@ -313,8 +282,6 @@ where
 		Proof = <EnableProofRecording as ProofRecording>::Proof,
 	>,
 	ParaClient: ProvideRuntimeApi<B> + Send + Sync,
-	// We require the client to provide both runtime apis, but only one will be called
-	ParaClient::Api: AuthorFilterAPI<B, NimbusId>,
 	ParaClient::Api: NimbusApi<B>,
 	CIDP: CreateInherentDataProviders<B, (PHash, PersistedValidationData)>,
 {
@@ -472,11 +439,8 @@ where
 	>,
 	BI: BlockImport<Block> + Send + Sync + 'static,
 	RBackend: Backend<PBlock> + 'static,
-	// Rust bug: https://github.com/rust-lang/rust/issues/24159
-	sc_client_api::StateBackendFor<RBackend, PBlock>: sc_client_api::StateBackend<HashFor<PBlock>>,
 	ParaClient: ProvideRuntimeApi<Block> + Send + Sync + 'static,
 	ParaClient::Api: NimbusApi<Block>,
-	ParaClient::Api: AuthorFilterAPI<Block, NimbusId>,
 	CIDP: CreateInherentDataProviders<Block, (PHash, PersistedValidationData)> + 'static,
 {
 	NimbusConsensusBuilder::new(
@@ -516,8 +480,6 @@ impl<Block, PF, BI, RBackend, ParaClient, CIDP>
 	NimbusConsensusBuilder<Block, PF, BI, RBackend, ParaClient, CIDP>
 where
 	Block: BlockT,
-	// Rust bug: https://github.com/rust-lang/rust/issues/24159
-	sc_client_api::StateBackendFor<RBackend, PBlock>: sc_client_api::StateBackend<HashFor<PBlock>>,
 	PF: Environment<Block> + Send + Sync + 'static,
 	PF::Proposer: Proposer<
 		Block,
@@ -560,7 +522,6 @@ where
 	fn build(self) -> Box<dyn ParachainConsensus<Block>>
 	where
 		ParaClient::Api: NimbusApi<Block>,
-		ParaClient::Api: AuthorFilterAPI<Block, NimbusId>,
 	{
 		self.relay_chain_client.clone().execute_with(self)
 	}
@@ -570,8 +531,6 @@ impl<Block, PF, BI, RBackend, ParaClient, CIDP> polkadot_client::ExecuteWithClie
 	for NimbusConsensusBuilder<Block, PF, BI, RBackend, ParaClient, CIDP>
 where
 	Block: BlockT,
-	// Rust bug: https://github.com/rust-lang/rust/issues/24159
-	sc_client_api::StateBackendFor<RBackend, PBlock>: sc_client_api::StateBackend<HashFor<PBlock>>,
 	PF: Environment<Block> + Send + Sync + 'static,
 	PF::Proposer: Proposer<
 		Block,
@@ -583,7 +542,6 @@ where
 	RBackend: Backend<PBlock> + 'static,
 	ParaClient: ProvideRuntimeApi<Block> + Send + Sync + 'static,
 	ParaClient::Api: NimbusApi<Block>,
-	ParaClient::Api: AuthorFilterAPI<Block, NimbusId>,
 	CIDP: CreateInherentDataProviders<Block, (PHash, PersistedValidationData)> + 'static,
 {
 	type Output = Box<dyn ParachainConsensus<Block>>;
@@ -596,7 +554,6 @@ where
 		Api: polkadot_client::RuntimeApiCollection<StateBackend = PBackend::State>,
 		PClient: polkadot_client::AbstractClient<PBlock, PBackend, Api = Api> + 'static,
 		ParaClient::Api: NimbusApi<Block>,
-		ParaClient::Api: AuthorFilterAPI<Block, NimbusId>,
 	{
 		Box::new(NimbusConsensus::new(
 			self.para_id,

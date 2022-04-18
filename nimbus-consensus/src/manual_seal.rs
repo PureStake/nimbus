@@ -17,19 +17,14 @@
 use cumulus_primitives_parachain_inherent::{
 	ParachainInherentData, INHERENT_IDENTIFIER as PARACHAIN_INHERENT_IDENTIFIER,
 };
-use nimbus_primitives::{
-	AuthorFilterAPI, CompatibleDigestItem, NimbusApi, NimbusId, NIMBUS_ENGINE_ID,
-};
+use nimbus_primitives::{CompatibleDigestItem, NimbusApi, NimbusId, NIMBUS_ENGINE_ID};
 use sc_consensus::BlockImportParams;
 use sc_consensus_manual_seal::{ConsensusDataProvider, Error};
-use sp_api::{HeaderT, ProvideRuntimeApi, TransactionFor};
+use sp_api::{BlockT, HeaderT, ProvideRuntimeApi, TransactionFor};
 use sp_core::crypto::Public;
 use sp_inherents::InherentData;
 use sp_keystore::SyncCryptoStorePtr;
-use sp_runtime::{
-	generic::{Digest, DigestItem},
-	traits::Block as BlockT,
-};
+use sp_runtime::{Digest, DigestItem};
 use std::sync::Arc;
 
 /// Provides nimbus-compatible pre-runtime digests for use with manual seal consensus
@@ -47,7 +42,6 @@ where
 	B: BlockT,
 	C: ProvideRuntimeApi<B> + Send + Sync,
 	C::Api: NimbusApi<B>,
-	C::Api: AuthorFilterAPI<B, NimbusId>,
 {
 	type Transaction = TransactionFor<C, B>;
 
