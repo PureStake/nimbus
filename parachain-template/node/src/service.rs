@@ -9,7 +9,8 @@ use parachain_template_runtime::{
 };
 
 use nimbus_consensus::{
-	BuildNimbusConsensusParams, NimbusConsensus, NimbusManualSealConsensusDataProvider,
+	start_nimbus_standalone, BuildNimbusConsensusParams, NimbusBlockImport, NimbusConsensus,
+	NimbusManualSealConsensusDataProvider,
 };
 
 // Cumulus Imports
@@ -30,6 +31,7 @@ use cumulus_relay_chain_rpc_interface::RelayChainRPCInterface;
 use polkadot_service::CollatorPair;
 
 // Substrate Imports
+use sc_client_api::ExecutorProvider;
 use sc_consensus_manual_seal::{run_instant_seal, InstantSealParams};
 use sc_executor::NativeElseWasmExecutor;
 use sc_network::NetworkService;
@@ -76,7 +78,14 @@ pub fn new_partial<RuntimeApi, Executor>(
 			Block,
 			TFullClient<Block, RuntimeApi, NativeElseWasmExecutor<Executor>>,
 		>,
-		(Option<Telemetry>, Option<TelemetryWorkerHandle>),
+		(
+			//TODO I didn't expect to need this Arc. It looks different than Babe's in the Substrate node.
+			NimbusBlockImport<
+				Arc<TFullClient<Block, RuntimeApi, NativeElseWasmExecutor<Executor>>>,
+			>,
+			Option<Telemetry>,
+			Option<TelemetryWorkerHandle>,
+		),
 	>,
 	sc_service::Error,
 >
@@ -143,9 +152,11 @@ where
 		client.clone(),
 	);
 
+	let block_import = nimbus_consensus::NimbusBlockImport::new(client.clone(), parachain);
+
 	let import_queue = nimbus_consensus::import_queue(
 		client.clone(),
-		client.clone(),
+		block_import.clone(),
 		move |_, _| async move {
 			let time = sp_timestamp::InherentDataProvider::from_system_time();
 
@@ -153,7 +164,6 @@ where
 		},
 		&task_manager.spawn_essential_handle(),
 		config.prometheus_registry().clone(),
-		parachain,
 	)?;
 
 	let params = PartialComponents {
@@ -164,7 +174,7 @@ where
 		task_manager,
 		transaction_pool,
 		select_chain,
-		other: (telemetry, telemetry_worker_handle),
+		other: (block_import, telemetry, telemetry_worker_handle),
 	};
 
 	Ok(params)
@@ -256,7 +266,7 @@ where
 	let parachain_config = prepare_node_config(parachain_config);
 
 	let params = new_partial::<RuntimeApi, Executor>(&parachain_config, true)?;
-	let (mut telemetry, telemetry_worker_handle) = params.other;
+	let (_block_import, mut telemetry, telemetry_worker_handle) = params.other;
 
 	let client = params.client.clone();
 	let backend = params.backend.clone();
@@ -416,6 +426,9 @@ pub async fn start_parachain_node(
 			Ok(NimbusConsensus::build(BuildNimbusConsensusParams {
 				para_id: id,
 				proposer_factory,
+				//TODO We should use the NimbusBlockImport here. It overrides the longest chain rule
+				// in the parachain context. However, this is only a problem in the parachain context,
+				// and all the examples in the cumulus repo do it like this. So for now we leave it.
 				block_import: client.clone(),
 				parachain_client: client.clone(),
 				keystore,
@@ -456,7 +469,7 @@ pub async fn start_parachain_node(
 	.await
 }
 
-/// Builds a new service for a full client.
+/// Builds a new service for an instant-seal development node.
 pub fn start_instant_seal_node(config: Configuration) -> Result<TaskManager, sc_service::Error> {
 	let sc_service::PartialComponents {
 		client,
@@ -466,7 +479,7 @@ pub fn start_instant_seal_node(config: Configuration) -> Result<TaskManager, sc_
 		keystore_container,
 		select_chain,
 		transaction_pool,
-		other: (mut telemetry, _),
+		other: (block_import, mut telemetry, _),
 	} = new_partial::<RuntimeApi, TemplateRuntimeExecutor>(&config, false)?;
 
 	let (network, system_rpc_tx, network_starter) =
@@ -536,7 +549,7 @@ pub fn start_instant_seal_node(config: Configuration) -> Result<TaskManager, sc_
 		let (_hrmp_xcm_sender, hrmp_xcm_receiver) = flume::bounded::<(ParaId, Vec<u8>)>(100);
 
 		let authorship_future = run_instant_seal(InstantSealParams {
-			block_import: client.clone(),
+			block_import,
 			env: proposer,
 			client: client.clone(),
 			pool: transaction_pool.clone(),
@@ -586,4 +599,209 @@ pub fn start_instant_seal_node(config: Configuration) -> Result<TaskManager, sc_
 
 	network_starter.start_network();
 	Ok(task_manager)
+}
+
+/// Builds a new service for a sovereign chain full client.
+pub fn start_standalone_node(config: Configuration) -> Result<TaskManager, sc_service::Error> {
+	let sc_service::PartialComponents {
+		client,
+		backend,
+		mut task_manager,
+		import_queue,
+		keystore_container,
+		select_chain,
+		transaction_pool,
+		other: (block_import, mut telemetry, _),
+	} = new_partial::<RuntimeApi, TemplateRuntimeExecutor>(&config, false)?;
+
+	let (network, system_rpc_tx, network_starter) =
+		sc_service::build_network(sc_service::BuildNetworkParams {
+			config: &config,
+			client: client.clone(),
+			transaction_pool: transaction_pool.clone(),
+			spawn_handle: task_manager.spawn_handle(),
+			import_queue,
+			block_announce_validator_builder: None,
+			warp_sync: None,
+		})?;
+
+	if config.offchain_worker.enabled {
+		sc_service::build_offchain_workers(
+			&config,
+			task_manager.spawn_handle(),
+			client.clone(),
+			network.clone(),
+		);
+	}
+
+	let is_authority = config.role.is_authority();
+	let prometheus_registry = config.prometheus_registry().cloned();
+
+	let rpc_extensions_builder = {
+		let client = client.clone();
+		let transaction_pool = transaction_pool.clone();
+
+		Box::new(move |deny_unsafe, _| {
+			let deps = crate::rpc::FullDeps {
+				client: client.clone(),
+				pool: transaction_pool.clone(),
+				deny_unsafe,
+			};
+
+			Ok(crate::rpc::create_full(deps))
+		})
+	};
+
+	sc_service::spawn_tasks(sc_service::SpawnTasksParams {
+		network: network.clone(),
+		client: client.clone(),
+		keystore: keystore_container.sync_keystore(),
+		task_manager: &mut task_manager,
+		transaction_pool: transaction_pool.clone(),
+		rpc_extensions_builder,
+		backend,
+		system_rpc_tx,
+		config,
+		telemetry: telemetry.as_mut(),
+	})?;
+
+	if is_authority {
+		let proposer = sc_basic_authorship::ProposerFactory::new(
+			task_manager.spawn_handle(),
+			client.clone(),
+			transaction_pool.clone(),
+			prometheus_registry.as_ref(),
+			telemetry.as_ref().map(|t| t.handle()),
+		);
+
+		let client_set_aside_for_cidp = client.clone();
+
+		// SECURITY WARNING: It is not secure to have this xcm stuff in the runtime for a standalone chain.
+		// If you are using this template as the basis for a sovereign chain, you must remove the XCM stuff
+		// from FROM THE RUNTIME and also for here.
+		//
+		// We'll leave this code in the template for several reasons:
+		// 1. A single template runtime improves maintainability
+		// 2. Parachain developers will test their parachain runtime in sovereign mode (an instant seal mode)
+		// 3. Leaving this code on the client-side makes is more obvious that XCM and other parachain-secific
+		//    code must be stripped before production use.
+		//
+		// YOU'VE BEEN WARNED
+
+		// Create channels for mocked XCM messages.
+		let (_downward_xcm_sender, downward_xcm_receiver) = flume::bounded::<Vec<u8>>(100);
+		let (_hrmp_xcm_sender, hrmp_xcm_receiver) = flume::bounded::<(ParaId, Vec<u8>)>(100);
+
+		let can_author_with =
+			sp_consensus::CanAuthorWithNativeVersion::new(client.executor().clone());
+
+		let authorship_future = start_nimbus_standalone(
+			client.clone(),
+			select_chain,
+			block_import,
+			proposer, //It's actually a proposer_factory. The name came from the template.
+			//TODO, I didn't pass the pool here. Does something know how to get the transactions it needs?
+			// Instant seal took the pool, hopefully just for triggers... Actually Manual seal takes it too...
+			keystore_container.sync_keystore(),
+			network.clone(),
+			can_author_with,
+			// This is the create_inherent_data_providers function. Maybe positional arguments are not sufficient here.
+			move |block, _extra_args| {
+				let downward_xcm_receiver = downward_xcm_receiver.clone();
+				let hrmp_xcm_receiver = hrmp_xcm_receiver.clone();
+
+				let client_for_xcm = client_set_aside_for_cidp.clone();
+
+				async move {
+					let time = sp_timestamp::InherentDataProvider::from_system_time();
+
+					// The nimbus runtime is shared among all nodes including the parachain node.
+					// Because this is not a parachain context, we need to mock the parachain inherent data provider.
+					//TODO might need to go back and get the block number like how I do in Moonbeam
+					let mocked_parachain = MockValidationDataInherentDataProvider {
+						current_para_block: 0,
+						relay_offset: 0,
+						relay_blocks_per_para_block: 0,
+						xcm_config: MockXcmConfig::new(
+							&*client_for_xcm,
+							block,
+							Default::default(),
+							Default::default(),
+						),
+						raw_downward_messages: downward_xcm_receiver.drain().collect(),
+						raw_horizontal_messages: hrmp_xcm_receiver.drain().collect(),
+					};
+
+					Ok(SlotCompatibleInherentDataProviders {
+						time,
+						mocked_parachain,
+					})
+				}
+			},
+		)?;
+
+		task_manager.spawn_essential_handle().spawn_blocking(
+			"nimbus-standalone",
+			None,
+			authorship_future,
+		);
+	};
+
+	network_starter.start_network();
+	Ok(task_manager)
+}
+
+/// This is a hack because we need to implement https://crates.parity.io/sc_consensus_slots/trait.InherentDataProviderExt.html
+/// This trait allows sc-consensus-slots to extract the timestamp and slot from the inherents.
+/// The only problem is that the provided impls are pretty basic and assume that the timestamp comes from the first
+/// inherent and the slot fomr the second.
+/// In our case we only explicitly provide a timestamp, and the slot is calculated from it.
+struct SlotCompatibleInherentDataProviders {
+	// I could put a slot duration field in here. Then in the service we pass the same duration....
+	time: sp_timestamp::InherentDataProvider,
+	mocked_parachain: MockValidationDataInherentDataProvider,
+}
+
+use sp_consensus_slots::Slot;
+use sp_inherents::{InherentData, InherentDataProvider, InherentIdentifier};
+use sp_timestamp::Timestamp;
+#[async_trait::async_trait]
+impl InherentDataProvider for SlotCompatibleInherentDataProviders {
+	fn provide_inherent_data(
+		&self,
+		inherent_data: &mut InherentData,
+	) -> Result<(), sp_inherents::Error> {
+		// This was my attempt at doing this somewhat elegantly, but I ran into ownership issues.
+		// InherentDataProvider::provide_inherent_data(&(self.time, self.mocked_parachain), inherent_data)
+
+		// Here's my next attempt based on how this trait is implemented for tuples.
+		// We pass the same buffer to both of the data providers. I guess they append it...
+		self.time.provide_inherent_data(inherent_data)?;
+		self.mocked_parachain.provide_inherent_data(inherent_data)?;
+
+		Ok(())
+	}
+
+	async fn try_handle_error(
+		&self,
+		_identifier: &InherentIdentifier,
+		_error: &[u8],
+	) -> Option<Result<(), sp_inherents::Error>> {
+		// This also didn't work for ownership reasons.
+		// InherentDataProvider::try_handle_error(&(self.time, self.mocked_parachain), identifier, error).await
+		//TODO We are not doing any error handling here, and even suppressing the internal error handling of the individual data providers.
+		None
+	}
+}
+
+impl sc_consensus_slots::InherentDataProviderExt for SlotCompatibleInherentDataProviders {
+	fn timestamp(&self) -> Timestamp {
+		self.time.timestamp()
+	}
+
+	fn slot(&self) -> Slot {
+		// TODO yuck. Here is another place were we hardcode the 6 second block time.
+		let slot_number = *self.timestamp() / 6000;
+		slot_number.into()
+	}
 }

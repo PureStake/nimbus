@@ -24,7 +24,7 @@ use cumulus_client_consensus_common::{
 	ParachainBlockImport, ParachainCandidate, ParachainConsensus,
 };
 use cumulus_primitives_core::{relay_chain::v2::Hash as PHash, ParaId, PersistedValidationData};
-pub use import_queue::import_queue;
+pub use import_queue::{import_queue, NimbusBlockImport};
 use log::{debug, info, warn};
 use nimbus_primitives::{
 	AuthorFilterAPI, CompatibleDigestItem, DigestsProvider, NimbusApi, NimbusId, NIMBUS_KEY_ID,
@@ -47,7 +47,9 @@ use std::{marker::PhantomData, sync::Arc, time::Duration};
 use tracing::error;
 mod import_queue;
 mod manual_seal;
+mod standalone;
 pub use manual_seal::NimbusManualSealConsensusDataProvider;
+pub use standalone::start_nimbus_standalone;
 
 const LOG_TARGET: &str = "filtering-consensus";
 
@@ -360,13 +362,6 @@ where
 			}
 		};
 
-		let proposer_future = self.proposer_factory.lock().init(&parent);
-
-		let proposer = proposer_future
-			.await
-			.map_err(|e| error!(target: LOG_TARGET, error = ?e, "Could not create proposer."))
-			.ok()?;
-
 		let nimbus_id = NimbusId::from_slice(&type_public_pair.1)
 			.map_err(
 				|e| error!(target: LOG_TARGET, error = ?e, "Invalid Nimbus ID (wrong length)."),
@@ -388,6 +383,13 @@ where
 				.provide_digests(nimbus_id, parent.hash()),
 		);
 		let inherent_digests = sp_runtime::generic::Digest { logs };
+
+		let proposer_future = self.proposer_factory.lock().init(&parent);
+
+		let proposer = proposer_future
+			.await
+			.map_err(|e| error!(target: LOG_TARGET, error = ?e, "Could not create proposer."))
+			.ok()?;
 
 		let Proposal {
 			block,
